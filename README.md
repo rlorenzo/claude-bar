@@ -73,7 +73,7 @@ It works because ClaudeBar now holds its own token pair: refreshing rotates *its
 
 The sign-in asks for one scope, `user:profile`, which is all the usage endpoint needs — verified against the live endpoints rather than assumed. Signing out deletes ClaudeBar's copy of the token and asks Anthropic to revoke the grant; the delete always happens, but if the revoke can't reach Anthropic the grant stays live until its refresh token expires.
 
-One caveat: sign-in reuses Claude Code's own OAuth client, since there's no public third-party OAuth for this endpoint. It's the same "act as Claude Code" posture as the `claude-code` User-Agent ClaudeBar already sends, and it could break if Anthropic changes the flow — the fallback keeps the app working if it does.
+One caveat: sign-in reuses Claude Code's own OAuth client, since there's no public third-party OAuth for this endpoint. So the browser's consent screen says **Claude Code**, not ClaudeBar. It's the same "act as Claude Code" posture as the `claude-code` User-Agent ClaudeBar already sends, and it could break if Anthropic changes the flow — the fallback keeps the app working if it does.
 
 The default stays read-only and prompt-bearing; self-contained is opt-in.
 

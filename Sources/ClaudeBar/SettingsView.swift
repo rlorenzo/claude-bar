@@ -120,6 +120,14 @@ struct SettingsView: View {
         )
     }
 
+    /// Shown before the user starts a sign-in, because the consent screen names Claude Code
+    /// rather than ClaudeBar and that's alarming without warning.
+    private var signInDisclosure: some View {
+        Text("The browser will say **Claude Code** — Anthropic doesn't publish a third-party OAuth client for the usage endpoint, so ClaudeBar signs in as the CLI does. It asks for one permission, `\(OAuthConfig.scopes)`, and nothing else. Both tokens live in ClaudeBar's own Keychain item: the access token is only ever sent to the usage endpoint, the refresh token only to Anthropic's token and revoke endpoints.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+    }
+
     @ViewBuilder
     private var signInControls: some View {
         switch login.phase {
@@ -132,6 +140,7 @@ struct SettingsView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
+            signInDisclosure
 
         case .awaitingCode:
             VStack(alignment: .leading, spacing: 8) {
