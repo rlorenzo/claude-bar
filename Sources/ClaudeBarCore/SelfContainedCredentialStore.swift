@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 import os
 import Security
@@ -120,6 +121,7 @@ public struct SelfContainedCredentialStore: Sendable {
         // ThisDeviceOnly keeps the credential from syncing to iCloud Keychain or a backup.
         let attributes: [String: Any] = [
             kSecValueData as String: data,
+            kSecAttrGeneric as String: Self.identity(of: tokens),
             kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         ]
 
@@ -128,6 +130,47 @@ public struct SelfContainedCredentialStore: Sendable {
         guard updateStatus == errSecItemNotFound else { return false }
 
         return SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil) == errSecSuccess
+    }
+
+    /// Tags a stored credential so a rotation can tell *which* one it's replacing. Hashed
+    /// rather than stored raw: `kSecAttrGeneric` is a searchable attribute, and a refresh token
+    /// has no business sitting in one.
+    private static func identity(of tokens: OAuthTokens) -> Data {
+        Data(SHA256.hash(data: Data(tokens.refreshToken.utf8)))
+    }
+
+    /// What happened when persisting a rotated pair. `superseded` is a legitimate outcome, not
+    /// a failure: the credential we rotated from was signed out or replaced meanwhile.
+    public enum RotatedSaveResult: Sendable, Equatable { case saved, superseded, failed }
+
+    /// Persists a refreshed pair over the exact credential it was rotated from — a
+    /// compare-and-swap, not a blind write, and never a create.
+    ///
+    /// A refresh is a network round trip, so the Keychain can change under it: the user can
+    /// sign out, or sign out *and* sign back in, before it lands. Matching on the identity of
+    /// `previous` means the Keychain itself arbitrates. If the item was deleted, or replaced by
+    /// a different sign-in, nothing matches and the write is a no-op — where a blind
+    /// service+account update would have clobbered a fresh credential with a stale grant's
+    /// tokens, and a `SecItemAdd` fallback would have resurrected a signed-out one.
+    func saveRotated(_ tokens: OAuthTokens, replacing previous: OAuthTokens) -> RotatedSaveResult {
+        guard let data = try? JSONEncoder().encode(tokens) else { return .failed }
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecAttrGeneric as String: Self.identity(of: previous)
+        ]
+        let attributes: [String: Any] = [
+            kSecValueData as String: data,
+            kSecAttrGeneric as String: Self.identity(of: tokens),
+            kSecAttrAccessible as String: kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        ]
+
+        switch SecItemUpdate(query as CFDictionary, attributes as CFDictionary) {
+        case errSecSuccess: return .saved
+        case errSecItemNotFound: return .superseded
+        default: return .failed
+        }
     }
 
     /// Deletes our copy of the token. This does *not* revoke the grant server-side — pair it
@@ -161,9 +204,18 @@ public struct SelfContainedCredentialStore: Sendable {
             return tokens.accessToken
         }
         let refreshed = try await client.refresh(refreshToken: tokens.refreshToken, grantedScope: tokens.scope)
-        // A refresh rotates the refresh token, so a failed save would strand us: the old
-        // token is now invalid and the new one isn't persisted. Fail loudly instead.
-        guard save(refreshed) else { throw StoreError.keychainWriteFailed }
-        return refreshed.accessToken
+        switch saveRotated(refreshed, replacing: tokens) {
+        case .saved:
+            return refreshed.accessToken
+        case .superseded:
+            // Signed out, or signed out and back in, while this refresh was in flight. Report
+            // not-signed-in for this poll rather than writing a now-orphaned pair over whatever
+            // replaced it; the next poll picks up whatever is actually stored.
+            return nil
+        case .failed:
+            // A refresh rotates the refresh token, so a failed write would strand us: the old
+            // token is now invalid and the new one isn't persisted. Fail loudly instead.
+            throw StoreError.keychainWriteFailed
+        }
     }
 }

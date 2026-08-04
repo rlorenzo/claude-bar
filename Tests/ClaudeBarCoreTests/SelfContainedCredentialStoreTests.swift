@@ -14,8 +14,8 @@ private actor RevokeRecorder {
 /// Gated on a usable Keychain: a CI runner may have no unlocked login keychain, and failing
 /// there would say nothing about the code. `OAuthScopeStalenessTests` covers the staleness
 /// decision unconditionally; these add what only a real item shows — that a stale grant is
-/// deleted rather than ignored, and that a revoke can't disturb a credential the user has since
-/// signed back in with.
+/// deleted rather than ignored, and that neither a landing refresh nor a revoke can disturb a
+/// credential the user has since signed back in with.
 struct SelfContainedCredentialStoreTests {
     private static func store(
         _ service: String,
@@ -148,6 +148,73 @@ struct SelfContainedCredentialStoreTests {
         #expect(store.isSignedIn)
     }
 
+    private static func rotated(from previous: OAuthTokens) -> OAuthTokens {
+        OAuthTokens(
+            accessToken: "rotated-at",
+            refreshToken: "rotated-rt",
+            expiresAt: previous.expiresAt.addingTimeInterval(3600),
+            scope: previous.scope
+        )
+    }
+
+    @Test(.enabled(if: keychainAvailable))
+    func rotatedPairReplacesTheCredentialItCameFrom() {
+        let service = "com.gordonbeeming.ClaudeBar.tests.rotate"
+        let store = Self.store(service)
+        defer { store.clear() }
+
+        let original = Self.tokens(scope: OAuthConfig.scopes)
+        #expect(store.save(original))
+
+        #expect(store.saveRotated(Self.rotated(from: original), replacing: original) == .saved)
+        #expect(store.load()?.accessToken == "rotated-at")
+    }
+
+    /// A refresh that lands after sign-out must not resurrect the credential. A plain `save`
+    /// would: its `SecItemAdd` fallback re-creates a deleted item, leaving a usable token
+    /// behind a signed-out UI.
+    @Test(.enabled(if: keychainAvailable))
+    func refreshLandingAfterSignOutDoesNotResurrectTheCredential() {
+        let service = "com.gordonbeeming.ClaudeBar.tests.rotate-after-signout"
+        let store = Self.store(service)
+        defer { store.clear() }
+
+        let original = Self.tokens(scope: OAuthConfig.scopes)
+        #expect(store.save(original))
+        store.clear()
+
+        #expect(store.saveRotated(Self.rotated(from: original), replacing: original) == .superseded)
+        #expect(store.evaluate() == .missing)
+        #expect(!store.isSignedIn)
+    }
+
+    /// The harder version: the user signs out *and back in* while a refresh is in flight. The
+    /// item exists again, so an update matching only service+account would overwrite the fresh
+    /// credential with the old grant's rotated tokens. Matching on the credential being
+    /// replaced makes it a no-op instead.
+    @Test(.enabled(if: keychainAvailable))
+    func refreshLandingAfterAFreshSignInDoesNotOverwriteIt() {
+        let service = "com.gordonbeeming.ClaudeBar.tests.rotate-after-resignin"
+        let store = Self.store(service)
+        defer { store.clear() }
+
+        let original = Self.tokens(scope: OAuthConfig.scopes)
+        #expect(store.save(original))
+        store.clear()
+
+        let fresh = OAuthTokens(
+            accessToken: "fresh-at",
+            refreshToken: "fresh-rt",
+            expiresAt: Date().addingTimeInterval(3600),
+            scope: OAuthConfig.scopes
+        )
+        #expect(store.save(fresh))
+
+        #expect(store.saveRotated(Self.rotated(from: original), replacing: original) == .superseded)
+        #expect(store.load()?.accessToken == "fresh-at")
+        #expect(store.isSignedIn)
+    }
+
     /// `evaluate()` maps an undecodable item to `.missing` and leaves the bytes alone; pinned
     /// so the leave-in-place choice is deliberate rather than incidental.
     @Test(.enabled(if: keychainAvailable))
@@ -162,4 +229,5 @@ struct SelfContainedCredentialStoreTests {
         #expect(store.load() == nil)
         #expect(!store.isSignedIn)
     }
+
 }
