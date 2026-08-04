@@ -34,11 +34,27 @@ struct OAuthURLTests {
         #expect(params["client_id"] == OAuthConfig.clientID)
         #expect(params["response_type"] == "code")
         #expect(params["redirect_uri"] == OAuthConfig.redirectURI)
-        #expect(params["scope"] == OAuthConfig.scopes)
+        // Pinned as a literal rather than compared to OAuthConfig.scopes: this is the
+        // assertion that has to fail if someone widens the constant, and comparing the
+        // constant to itself would let any change through.
+        #expect(params["scope"] == "user:profile")
         #expect(params["code_challenge"] == "CHAL")
         #expect(params["code_challenge_method"] == "S256")
         #expect(params["state"] == "STATE")
         #expect(params["code"] == "true")
+    }
+}
+
+struct OAuthScopeTests {
+    @Test func requestsOnlyWhatTheUsageEndpointNeeds() {
+        // `user:profile` was verified live as sufficient for GET /api/oauth/usage. See the
+        // note on OAuthConfig.scopes before changing this.
+        #expect(OAuthConfig.scopes == "user:profile")
+    }
+
+    @Test func neverRequestsApiKeyCreation() {
+        // The point of the whole change: this token must not be able to mint org API keys.
+        #expect(!OAuthConfig.scopes.contains("org:create_api_key"))
     }
 }
 
