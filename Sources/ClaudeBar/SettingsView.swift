@@ -123,8 +123,15 @@ struct SettingsView: View {
     @ViewBuilder
     private var signInControls: some View {
         switch login.phase {
-        case .signedOut:
+        // Both signed-out phases offer the same sign-in; the stale-scope one just explains
+        // first why the user is looking at it again.
+        case .signedOut, .signedOutStaleScope:
             Button("Sign in with Claude…") { login.startSignIn() }
+            if login.phase == .signedOutStaleScope {
+                Text("You were signed out: the earlier sign-in had asked for more access than ClaudeBar needs, including permission to create API keys for your organisation. That token has been deleted and ClaudeBar asked Anthropic to revoke it.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
 
         case .awaitingCode:
             VStack(alignment: .leading, spacing: 8) {

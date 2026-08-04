@@ -1,4 +1,5 @@
 import Foundation
+import os
 import Security
 
 /// Reads and writes *our own* OAuth token pair in a Keychain item this app created. Because
@@ -8,18 +9,55 @@ import Security
 public struct SelfContainedCredentialStore: Sendable {
     public enum StoreError: Error { case keychainWriteFailed }
 
+    /// What was found in the Keychain. `clearedStaleScope` is reported rather than folded
+    /// into `none` so Settings can explain the sign-out instead of the user finding
+    /// themselves silently logged out.
+    public enum StoredCredential: Sendable, Equatable {
+        /// Named `missing` rather than `none` so a `case .none:` never reads as if `evaluate()`
+        /// returned an Optional.
+        case missing
+        case usable(OAuthTokens)
+        /// Dropped because its grant is wider than what this build requests, or predates
+        /// scope recording. Carries the stored scope for logging (empty when unknown).
+        case clearedStaleScope(storedScope: String)
+    }
+
     private let service: String
     private let account = "oauth-tokens"
     private let client: OAuthClient
+    /// How a retired grant gets revoked. Indirected purely so tests can exercise the
+    /// stale-scope migration without posting a revoke to Anthropic; production always gets
+    /// the real call below.
+    private let revokeHandler: @Sendable (String) async -> Void
+
+    private static let logger = Logger(subsystem: "com.gordonbeeming.ClaudeBar", category: "OAuthRevoke")
 
     public init(service: String = "com.gordonbeeming.ClaudeBar.oauth", client: OAuthClient = OAuthClient()) {
         self.service = service
         self.client = client
+        // Logged rather than swallowed: a failed revoke leaves the grant live until its refresh
+        // token expires, and this is the only record that it happened. Still not rethrown —
+        // callers have already deleted our copy and can't act on it.
+        self.revokeHandler = { refreshToken in
+            do {
+                try await client.revoke(refreshToken: refreshToken)
+            } catch {
+                Self.logger.error("grant revocation failed: \(String(describing: error), privacy: .public)")
+            }
+        }
+    }
+
+    init(service: String, client: OAuthClient = OAuthClient(), revokeHandler: @escaping @Sendable (String) async -> Void) {
+        self.service = service
+        self.client = client
+        self.revokeHandler = revokeHandler
     }
 
     public var isSignedIn: Bool { load() != nil }
 
-    public func load() -> OAuthTokens? {
+    /// The single chokepoint for reading the item, so the scope invariant can't be bypassed
+    /// by a caller that reaches for the token directly.
+    public func evaluate() -> StoredCredential {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
@@ -30,9 +68,36 @@ public struct SelfContainedCredentialStore: Sendable {
         var item: AnyObject?
         guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
               let data = item as? Data else {
-            return nil
+            return .missing
         }
-        return try? JSONDecoder().decode(OAuthTokens.self, from: data)
+        // Undecodable bytes are left in place rather than deleted: there's no token to revoke,
+        // the next sign-in overwrites the item anyway, and deleting on a failed decode would
+        // add a destructive path for no gain.
+        guard let tokens = try? JSONDecoder().decode(OAuthTokens.self, from: data) else {
+            return .missing
+        }
+        guard OAuthTokens.isStale(storedScope: tokens.scope, requestedScope: OAuthConfig.scopes) else {
+            return .usable(tokens)
+        }
+        retireStaleGrant(tokens)
+        return .clearedStaleScope(storedScope: tokens.scope)
+    }
+
+    public func load() -> OAuthTokens? {
+        guard case .usable(let tokens) = evaluate() else { return nil }
+        return tokens
+    }
+
+    /// Retires a grant this build wouldn't ask for — in practice the old `org:create_api_key`
+    /// pair. Deletes locally *and* revokes, since deleting alone leaves the grant usable by
+    /// anyone who already captured it. The revoke is detached and best-effort: `evaluate()` is
+    /// synchronous and on the poll path, and an offline revoke must not keep the over-scoped
+    /// token in the Keychain. Deletion is the guaranteed step.
+    private func retireStaleGrant(_ tokens: OAuthTokens) {
+        clear()
+        let revoke = revokeHandler
+        let refreshToken = tokens.refreshToken
+        Task.detached { await revoke(refreshToken) }
     }
 
     /// Persists the pair, replacing any existing one. Returns false if the Keychain write
@@ -65,6 +130,8 @@ public struct SelfContainedCredentialStore: Sendable {
         return SecItemAdd(query.merging(attributes) { _, new in new } as CFDictionary, nil) == errSecSuccess
     }
 
+    /// Deletes our copy of the token. This does *not* revoke the grant server-side — pair it
+    /// with `revokeGrant(refreshToken:)`, as `OAuthLoginController.signOut()` does.
     public func clear() {
         let query: [String: Any] = [
             kSecClass as String: kSecClassGenericPassword,
@@ -74,17 +141,26 @@ public struct SelfContainedCredentialStore: Sendable {
         SecItemDelete(query as CFDictionary)
     }
 
-    /// The current access token, refreshing first when it's near expiry. Returns nil only
-    /// when there's no stored token (not signed in). A refresh failure is *thrown*, not
-    /// swallowed, so the caller can tell an auth rejection (fall back to Claude Code) apart
-    /// from a network/server error (fail the poll rather than needlessly hit Claude Code's
-    /// Keychain — which would prompt, then fail anyway because the network is down).
+    /// Revokes one specific grant. Deliberately takes the token rather than reading the
+    /// Keychain itself: sign-out deletes synchronously and revokes detached, so a re-read here
+    /// could pick up — and kill — a credential from a sign-in that completed in between. If the
+    /// revoke fails the grant lives until its refresh token expires, which beats keeping our
+    /// copy because the network was down.
+    public func revokeGrant(refreshToken: String) async {
+        await revokeHandler(refreshToken)
+    }
+
+    /// The current access token, refreshing first when it's near expiry. Returns nil when
+    /// there's no stored token (not signed in). A refresh failure is *thrown*, not swallowed,
+    /// so the caller can tell an auth rejection (fall back to Claude Code) apart from a
+    /// network/server error (fail the poll rather than needlessly hit Claude Code's Keychain —
+    /// which would prompt, then fail anyway because the network is down).
     public func validAccessToken(now: Date = Date()) async throws -> String? {
         guard let tokens = load() else { return nil }
         guard OAuthClient.needsRefresh(expiresAt: tokens.expiresAt, now: now) else {
             return tokens.accessToken
         }
-        let refreshed = try await client.refresh(refreshToken: tokens.refreshToken)
+        let refreshed = try await client.refresh(refreshToken: tokens.refreshToken, grantedScope: tokens.scope)
         // A refresh rotates the refresh token, so a failed save would strand us: the old
         // token is now invalid and the new one isn't persisted. Fail loudly instead.
         guard save(refreshed) else { throw StoreError.keychainWriteFailed }

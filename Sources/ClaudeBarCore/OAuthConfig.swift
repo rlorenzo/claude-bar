@@ -27,4 +27,7 @@ public enum OAuthConfig {
     /// `org:create_api_key` let this Keychain item mint organization API keys, to render a
     /// percentage. Don't widen without re-testing live.
     public static let scopes = "user:profile"
+
+    /// Revoking here actually retires a grant. Deleting our Keychain item only drops our copy.
+    public static let revokeURL = URL(string: "https://platform.claude.com/v1/oauth/token/revoke")!
 }
